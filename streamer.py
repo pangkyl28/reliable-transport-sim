@@ -10,6 +10,9 @@ from socket import INADDR_ANY
 
 TYPE_DATA = 0
 TYPE_ACK = 1
+TYPE_FIN = 2
+ACK_TIMEOUT = 0.25
+GRACE_PERIOD = 2.0
 
 HEADER_FMT = '!BI'  # 1 byte type, 4 bytes seq number
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
@@ -37,6 +40,7 @@ class Streamer:
         
         self.last_acked = -1
         self.ack_ready = Condition(self.lock)
+        self.got_fin = False
         # background listener
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.executor.submit(self.listener)
@@ -74,6 +78,13 @@ class Streamer:
                         if seq > self.last_acked:
                             self.last_acked = seq
                         self.ack_ready.notify_all()
+                
+                elif ptype == TYPE_FIN:
+                    with self.lock:
+                        self.got_fin = True
+
+                    fin_ack = struct.pack(HEADER_FMT, TYPE_ACK, seq)
+                    self.socket.sendto(fin_ack, (self.dst_ip, self.dst_port))
 
             except Exception as e:
                 if not self.closed:
@@ -95,10 +106,16 @@ class Streamer:
             pkt = struct.pack(HEADER_FMT, TYPE_DATA, seq) + chunk
             self.socket.sendto(pkt, (self.dst_ip, self.dst_port))
             # wait for ACK
-            with self.ack_ready:
-                while self.last_acked < seq and not self.closed:
-                    self.ack_ready.wait(timeout=0.1)
-
+            t0 = time.time()
+            while not self.closed:
+                with self.ack_ready:
+                    if self.last_acked >= seq:
+                        break
+                    self.ack_ready.wait(timeout=0.05)
+                # timeout => resend
+                if time.time() - t0 >= ACK_TIMEOUT:
+                    self.socket.sendto(pkt, (self.dst_ip, self.dst_port))
+                    t0 = time.time()
             self.send_seq += 1
 
         # self.socket.sendto(data_bytes, (self.dst_ip, self.dst_port))
@@ -126,9 +143,32 @@ class Streamer:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
-        self.closed = True
-        self.socket.stoprecv() # unblock listener if it's waiting
+        fin_seq = self.send_seq
+        self.send_seq += 1
+        fin_pkt = struct.pack(HEADER_FMT, TYPE_FIN, fin_seq)
 
+        self.socket.sendto(fin_pkt, (self.dst_ip, self.dst_port))
+
+        t0 = time.time()
+        while True:
+            with self.ack_ready:
+                if self.last_acked >= fin_seq:
+                    break
+                self.ack_ready.wait(timeout=0.05)
+            if time.time() - t0 >= ACK_TIMEOUT:
+                self.socket.sendto(fin_pkt, (self.dst_ip, self.dst_port))
+                t0 = time.time()
+        
+        while True:
+            with self.lock:
+                if self.got_fin:
+                    break
+            time.sleep(0.05)
+        
+        time.sleep(GRACE_PERIOD)
+
+        self.closed = True
+        self.socket.stoprecv()
         try:
             self.executor.shutdown(wait=False)
         except Exception:
