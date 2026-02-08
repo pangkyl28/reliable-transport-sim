@@ -8,6 +8,14 @@ from lossy_socket import LossyUDP
 # do not import anything else from socket except INADDR_ANY
 from socket import INADDR_ANY
 
+TYPE_DATA = 0
+TYPE_ACK = 1
+
+HEADER_FMT = '!BI'  # 1 byte type, 4 bytes seq number
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
+MAX_UDP = 1472  # maximum UDP payload size for LossyUDP
+MAX_PAYLOAD = MAX_UDP - HEADER_SIZE
+
 
 class Streamer:
     def __init__(self, dst_ip, dst_port,
@@ -26,12 +34,16 @@ class Streamer:
         self.closed = False
         self.lock = Lock()
         self.data_ready = Condition(self.lock)
+        
+        self.last_acked = -1
+        self.ack_ready = Condition(self.lock)
         # background listener
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.executor.submit(self.listener)
 
+        
+
     def listener(self):
-        HEADER_SIZE = 4
         while not self.closed:
             try:
                 packet, addr = self.socket.recvfrom()
@@ -42,14 +54,27 @@ class Streamer:
                 if len(packet) < HEADER_SIZE:
                     continue # ignore malformed packet
 
-                seq = struct.unpack('!I', packet[:HEADER_SIZE])[0]
+                ptype, seq = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
                 payload = packet[HEADER_SIZE:]
 
-                with self.data_ready: # acquires lock
-                    if seq >= self.expected_seq and seq not in self.recv_buffer:
-                        self.recv_buffer[seq] = payload
-                        self.data_ready.notify_all() # wake up recv() if it's waiting for this seq
-            
+                if ptype == TYPE_DATA:
+                    # buffer payload
+                    with self.data_ready:
+                        if seq >= self.expected_seq and seq not in self.recv_buffer:
+                            self.recv_buffer[seq] = payload
+                            self.data_ready.notify_all()
+
+                    # send ACK
+                    ack_pkt = struct.pack(HEADER_FMT, TYPE_ACK, seq)
+                    self.socket.sendto(ack_pkt, (self.dst_ip, self.dst_port))
+                
+                elif ptype == TYPE_ACK:
+                    # record ack so send() can finish
+                    with self.ack_ready:
+                        if seq > self.last_acked:
+                            self.last_acked = seq
+                        self.ack_ready.notify_all()
+
             except Exception as e:
                 if not self.closed:
                     print("Listener died!")
@@ -61,16 +86,19 @@ class Streamer:
         # Your code goes here!  The code below should be changed!
 
         # for now I'm just sending the raw application-level data in one UDP payload
-        HEADER_SIZE = 4 # 4 bytes for seq
-        MAX_UDP = 1472
-
-        MAX_PAYLOAD = MAX_UDP - HEADER_SIZE # must be <= 1472 for LossyUDP
 
         # send data in chunks of MAX_PAYLOAD bytes
         for i in range(0, len(data_bytes), MAX_PAYLOAD):
             chunk = data_bytes[i:i+MAX_PAYLOAD]
-            header = struct.pack('!I', self.send_seq)
-            self.socket.sendto(header + chunk, (self.dst_ip, self.dst_port))
+            seq = self.send_seq
+
+            pkt = struct.pack(HEADER_FMT, TYPE_DATA, seq) + chunk
+            self.socket.sendto(pkt, (self.dst_ip, self.dst_port))
+            # wait for ACK
+            with self.ack_ready:
+                while self.last_acked < seq and not self.closed:
+                    self.ack_ready.wait(timeout=0.1)
+
             self.send_seq += 1
 
         # self.socket.sendto(data_bytes, (self.dst_ip, self.dst_port))
