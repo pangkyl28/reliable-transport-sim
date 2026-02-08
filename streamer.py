@@ -19,7 +19,14 @@ class Streamer:
         # Your code goes here!  The code below should be changed!
 
         # for now I'm just sending the raw application-level data in one UDP payload
-        self.socket.sendto(data_bytes, (self.dst_ip, self.dst_port))
+        MAX_PAYLOAD = 1472 # must be <= 1472 for LossyUDP
+
+        # send data in chunks of MAX_PAYLOAD bytes
+        for i in range(0, len(data_bytes), MAX_PAYLOAD):
+            chunk = data_bytes[i:i+MAX_PAYLOAD]
+            self.socket.sendto(chunk, (self.dst_ip, self.dst_port))
+            
+        # self.socket.sendto(data_bytes, (self.dst_ip, self.dst_port))
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
