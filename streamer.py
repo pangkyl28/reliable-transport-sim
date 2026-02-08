@@ -2,6 +2,7 @@ import time
 import struct
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, Condition
+import hashlib
 
 # do not import anything else from loss_socket besides LossyUDP
 from lossy_socket import LossyUDP
@@ -14,7 +15,7 @@ TYPE_FIN = 2
 ACK_TIMEOUT = 0.25
 GRACE_PERIOD = 2.0
 
-HEADER_FMT = '!BI'  # 1 byte type, 4 bytes seq number
+HEADER_FMT = '!BI16s'  # 1 byte type, 4 bytes seq number, 16 bytes hash of payload
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 MAX_UDP = 1472  # maximum UDP payload size for LossyUDP
 MAX_PAYLOAD = MAX_UDP - HEADER_SIZE
@@ -58,8 +59,14 @@ class Streamer:
                 if len(packet) < HEADER_SIZE:
                     continue # ignore malformed packet
 
-                ptype, seq = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
+                ptype, seq, recv_digest = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
                 payload = packet[HEADER_SIZE:]
+
+                header_wo_hash = struct.pack('!BI', ptype, seq)
+                calc_digest = hashlib.md5(header_wo_hash + payload).digest()
+
+                if calc_digest != recv_digest:
+                    continue
 
                 if ptype == TYPE_DATA:
                     # buffer payload
@@ -69,7 +76,9 @@ class Streamer:
                             self.data_ready.notify_all()
 
                     # send ACK
-                    ack_pkt = struct.pack(HEADER_FMT, TYPE_ACK, seq)
+                    header_wo_hash = struct.pack('!BI', TYPE_ACK, seq)
+                    digest = hashlib.md5(header_wo_hash).digest()    
+                    ack_pkt = struct.pack(HEADER_FMT, TYPE_ACK, seq, digest)
                     self.socket.sendto(ack_pkt, (self.dst_ip, self.dst_port))
                 
                 elif ptype == TYPE_ACK:
@@ -83,7 +92,9 @@ class Streamer:
                     with self.lock:
                         self.got_fin = True
 
-                    fin_ack = struct.pack(HEADER_FMT, TYPE_ACK, seq)
+                    header_wo_hash = struct.pack('!BI', TYPE_ACK, seq)
+                    digest = hashlib.md5(header_wo_hash).digest()
+                    fin_ack = struct.pack(HEADER_FMT, TYPE_ACK, seq, digest)
                     self.socket.sendto(fin_ack, (self.dst_ip, self.dst_port))
 
             except Exception as e:
@@ -103,7 +114,9 @@ class Streamer:
             chunk = data_bytes[i:i+MAX_PAYLOAD]
             seq = self.send_seq
 
-            pkt = struct.pack(HEADER_FMT, TYPE_DATA, seq) + chunk
+            header_wo_hash = struct.pack('!BI', TYPE_DATA, seq)
+            digest = hashlib.md5(header_wo_hash + chunk).digest()
+            pkt = struct.pack(HEADER_FMT, TYPE_DATA, seq, digest) + chunk
             self.socket.sendto(pkt, (self.dst_ip, self.dst_port))
             # wait for ACK
             t0 = time.time()
@@ -145,7 +158,9 @@ class Streamer:
         # your code goes here, especially after you add ACKs and retransmissions.
         fin_seq = self.send_seq
         self.send_seq += 1
-        fin_pkt = struct.pack(HEADER_FMT, TYPE_FIN, fin_seq)
+        header_wo_hash = struct.pack('!BI', TYPE_FIN, fin_seq)
+        digest = hashlib.md5(header_wo_hash).digest()    
+        fin_pkt = struct.pack(HEADER_FMT, TYPE_FIN, fin_seq, digest)
 
         self.socket.sendto(fin_pkt, (self.dst_ip, self.dst_port))
 
