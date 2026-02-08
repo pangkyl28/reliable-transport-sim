@@ -64,8 +64,9 @@ def host2(listen_port, remote_port):
 
 def main():
     lossy_socket.sim = lossy_socket.SimulationParams(loss_rate=0.0, corruption_rate=0.0,
-                                                     max_delivery_delay=0.0,
+                                                     max_delivery_delay=0.1,
                                                      become_reliable_after=100000.0)
+    # originally max_delivery_delay was 0.0, but changed to 0.1 in accordance to part 2 instructions
 
     if len(sys.argv) < 4:
         print("usage is: python3 test.py [port1] [port2] [1|2]")
